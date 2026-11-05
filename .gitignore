@@ -1,7 +1,7 @@
+
 # Environment variables
 .env
 .env.*
-
 !.env.example
 
 # Python
@@ -20,6 +20,7 @@ build/
 *.sqlite
 *.sqlite3
 *.db
+backend/data/chroma_db/
 
 # IDE
 .vscode/
