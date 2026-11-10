@@ -1,11 +1,14 @@
 
 import os
+import time
+import logging
 from pathlib import Path
 from typing import Literal, List
 
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from google import genai
+from google.genai import errors
 
 try:
     from .retriever import retrieve_evidence
@@ -13,19 +16,21 @@ except ImportError:
     from retriever import retrieve_evidence
 
 
-# Load environment variables
+logger = logging.getLogger("guardian-ai")
+
 env_path = Path(__file__).resolve().parents[2] / ".env"
 load_dotenv(dotenv_path=env_path)
 
-api_key = os.getenv("GEMINI_API_KEY")
 
-if not api_key:
-    raise ValueError("GEMINI_API_KEY not found in .env")
+def get_gemini_client():
+    api_key = os.getenv("GEMINI_API_KEY")
 
-client = genai.Client(api_key=api_key)
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY not found in .env")
+
+    return genai.Client(api_key=api_key)
 
 
-# Structured verification response
 class VerificationResult(BaseModel):
     claim_id: str
     status: Literal["supported", "contradicted", "unverified"]
@@ -35,14 +40,17 @@ class VerificationResult(BaseModel):
     needs_human_decision: bool
 
 
-def verify_claim(claim_id, claim_text):
+def verify_claim(claim_id, claim_text, evidence=None):
     """
-    Verify a claim using evidence retrieved from ChromaDB.
+    Verify a claim using supplied trusted evidence.
+
+    If evidence is not supplied, retrieve it using the legacy
+    retrieval path for backward compatibility.
     """
 
-    evidence = retrieve_evidence(claim_text, top_k=3)
+    if evidence is None:
+        evidence = retrieve_evidence(claim_text, top_k=3)
 
-    # Prepare evidence for Gemini
     evidence_text = ""
 
     for item in evidence:
@@ -54,12 +62,28 @@ def verify_claim(claim_id, claim_text):
         )
 
     if not evidence:
-        evidence_text = "No relevant evidence was found."
+        logger.warning(
+            "No trusted evidence found for claim %s. "
+            "Returning unverified without calling Gemini.",
+            claim_id,
+        )
+
+        return VerificationResult(
+            claim_id=claim_id,
+            status="unverified",
+            explanation=(
+                "No trusted evidence is available in the evidence "
+                "database. This claim requires human review."
+            ),
+            confidence=0.0,
+            evidence_passage_ids=[],
+            needs_human_decision=True,
+        )
 
     prompt = f"""
 You are a strict factual claim verification system.
 
-Your task is to verify the given claim using ONLY the supplied evidence.
+Verify the claim using ONLY the supplied evidence.
 
 CLAIM:
 {claim_text}
@@ -81,21 +105,48 @@ RULES:
 Return the structured verification result.
 """
 
-    response = client.models.generate_content(
-        model="gemini-3.5-flash-lite",
-        contents=prompt,
-        config={
-            "response_mime_type": "application/json",
-            "response_schema": VerificationResult
-        }
-    )
+    client = get_gemini_client()
 
-    result = response.parsed
+    # Retry temporary API failures.
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model="gemini-3.5-flash-lite",
+                contents=prompt,
+                config={
+                    "response_mime_type": "application/json",
+                    "response_schema": VerificationResult
+                }
+            )
 
-    # Always preserve the original claim ID
-    result.claim_id = claim_id
+            result = response.parsed
 
-    return result
+            if result is None:
+                raise RuntimeError(
+                    "Gemini returned an empty verification result."
+                )
+
+            result.claim_id = claim_id
+            return result
+
+        except errors.APIError as exc:
+
+            retryable_codes = (429, 500, 502, 503, 504)
+
+            if exc.code not in retryable_codes or attempt == 2:
+                raise
+
+            delay = 2 ** (attempt + 1)
+
+            logger.warning(
+                "Gemini temporarily unavailable for claim %s. "
+                "Retrying in %s seconds. Attempt %s/3.",
+                claim_id,
+                delay,
+                attempt + 1
+            )
+
+            time.sleep(delay)
 
 
 if __name__ == "__main__":
